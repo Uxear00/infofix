@@ -348,6 +348,22 @@
       Reset
     </button>
 
+    <button
+      id="clearCacheBtn"
+      type="button"
+      onclick="clearMetadataCache()"
+      class="px-3 py-2
+             rounded-xl
+             border border-amber-400/15
+             bg-amber-500/5
+             text-xs font-medium
+             text-amber-300
+             hover:bg-amber-500/10
+             transition"
+    >
+      Clear Cache
+    </button>
+
   </div>
 
 </header>
@@ -429,7 +445,7 @@
 ==================================================== -->
 
 <section
-  class="grid grid-cols-2 lg:grid-cols-4
+  class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6
          gap-3 mb-6"
 >
 
@@ -518,9 +534,23 @@
              font-semibold
              text-indigo-300"
     >
-      Gemini
+      Gemini Lite
     </p>
 
+  </div>
+
+  <div
+    class="glass border border-white/10 rounded-2xl p-4 shadow-soft"
+  >
+    <p class="text-xs text-slate-500">API calls</p>
+    <p id="statApiCalls" class="mt-1 text-2xl font-bold">0</p>
+  </div>
+
+  <div
+    class="glass border border-emerald-400/10 rounded-2xl p-4 shadow-soft"
+  >
+    <p class="text-xs text-slate-500">Saved</p>
+    <p id="statSaved" class="mt-1 text-2xl font-bold text-emerald-300">0</p>
   </div>
 
 </section>
@@ -700,7 +730,7 @@
                leading-5
                text-slate-600"
       >
-        Gemini is recommended for image metadata generation.
+        Gemini Lite mode · 3.5 Flash-Lite primary · 3.1 Flash-Lite fallback · lower-cost, high-volume metadata generation.
       </div>
 
     </section>
@@ -1536,12 +1566,41 @@
 
     const CONFIG = {
 
-      // Current Gemini Interactions API model.
-      // Google currently documents gemini-3.8-flash.
-      GEMINI_MODEL: "gemini-3.8-flash",
+      // Gemini Interactions API.
+      // Use low-demand, high-throughput Flash-Lite models first.
+      // 3.5 Flash-Lite is the primary model for stock metadata;
+      // 3.1 Flash-Lite is an automatic fallback if the primary model
+      // is temporarily overloaded.
+      GEMINI_MODELS: [
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite"
+      ],
 
       GEMINI_ENDPOINT:
         "https://generativelanguage.googleapis.com/v1beta/interactions",
+
+      // Retry each Lite model briefly, then fail over to the next Lite model.
+      // This avoids sitting on one busy model for a long time while still
+      // protecting against short-lived capacity spikes.
+      RETRIES_PER_MODEL: 2,
+      RETRY_BASE_DELAY_MS: 1200,
+      RETRY_MAX_DELAY_MS: 30000,
+      RETRY_JITTER_MS: 1000,
+      REQUEST_TIMEOUT_MS: 120000,
+
+      // Generate one reusable master result per unique image.
+      // Slider changes are handled locally, so they do not create more
+      // Gemini requests for the same image.
+      MASTER_TITLE_LENGTH: 150,
+      MASTER_KEYWORD_COUNT: 60,
+
+      // Local image optimization to reduce multimodal input tokens.
+      MAX_AI_IMAGE_DIMENSION: 2048,
+      JPEG_QUALITY: 0.90,
+
+      CACHE_DB_NAME: "InfoFixMetadataCache",
+      CACHE_STORE_NAME: "metadata",
+      CACHE_VERSION: "master-v3-lite",
 
       OPENAI_ENDPOINT:
         "https://api.openai.com/v1/chat/completions",
@@ -1561,6 +1620,11 @@
     let currentProvider = "gemini";
 
     let processing = false;
+
+    // Per-run accounting. API calls counts every HTTP attempt, including retries.
+    let apiRequestCount = 0;
+    let cacheHitCount = 0;
+    let metadataDBPromise = null;
 
 
     /* =====================================================
@@ -1626,13 +1690,13 @@
 
       $("statProvider").textContent =
         provider === "gemini"
-          ? "Gemini"
+          ? "Gemini Lite"
           : "ChatGPT";
 
 
       $("providerHint").textContent =
         provider === "gemini"
-          ? "Gemini is recommended for image metadata generation."
+          ? "Gemini 3.5 Flash-Lite primary · 3.1 Flash-Lite automatic fallback."
           : "ChatGPT mode generates text-only metadata and does not analyze uploaded images.";
 
     }
@@ -1758,6 +1822,487 @@
         );
 
       }
+
+    }
+
+
+    /* =====================================================
+       SMART CACHE + IMAGE OPTIMIZATION
+    ===================================================== */
+
+    function openMetadataDB() {
+
+      if (metadataDBPromise) return metadataDBPromise;
+
+      metadataDBPromise = new Promise((resolve, reject) => {
+
+        if (!window.indexedDB) {
+          resolve(null);
+          return;
+        }
+
+        const request = indexedDB.open(
+          CONFIG.CACHE_DB_NAME,
+          1
+        );
+
+        request.onupgradeneeded = event => {
+
+          const db = event.target.result;
+
+          if (!db.objectStoreNames.contains(CONFIG.CACHE_STORE_NAME)) {
+            db.createObjectStore(
+              CONFIG.CACHE_STORE_NAME,
+              { keyPath: "key" }
+            );
+          }
+
+        };
+
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+
+      }).catch(error => {
+
+        console.warn(
+          "Metadata cache unavailable:",
+          error
+        );
+
+        return null;
+
+      });
+
+      return metadataDBPromise;
+
+    }
+
+
+    async function cacheGet(key) {
+
+      try {
+
+        const db = await openMetadataDB();
+
+        if (!db) return null;
+
+        return await new Promise((resolve, reject) => {
+
+          const tx = db.transaction(
+            CONFIG.CACHE_STORE_NAME,
+            "readonly"
+          );
+
+          const request = tx.objectStore(
+            CONFIG.CACHE_STORE_NAME
+          ).get(key);
+
+          request.onsuccess = () => resolve(request.result || null);
+          request.onerror = () => reject(request.error);
+
+        });
+
+      } catch (error) {
+
+        console.warn("Metadata cache read failed:", error);
+        return null;
+
+      }
+
+    }
+
+
+    async function cacheSet(key, metadata, fileName) {
+
+      try {
+
+        const db = await openMetadataDB();
+
+        if (!db) return false;
+
+        await new Promise((resolve, reject) => {
+
+          const tx = db.transaction(
+            CONFIG.CACHE_STORE_NAME,
+            "readwrite"
+          );
+
+          tx.objectStore(
+            CONFIG.CACHE_STORE_NAME
+          ).put({
+            key,
+            title: metadata.title,
+            keywords: metadata.keywords,
+            fileName: fileName || "",
+            savedAt: Date.now(),
+            version: CONFIG.CACHE_VERSION
+          });
+
+          tx.oncomplete = resolve;
+          tx.onerror = () => reject(tx.error);
+          tx.onabort = () => reject(tx.error);
+
+        });
+
+        return true;
+
+      } catch (error) {
+
+        console.warn("Metadata cache write failed:", error);
+        return false;
+
+      }
+
+    }
+
+
+    async function clearMetadataCache() {
+
+      if (processing) {
+
+        toast(
+          "Please wait until generation finishes before clearing the cache.",
+          false
+        );
+
+        return;
+
+      }
+
+      try {
+
+        const db = await openMetadataDB();
+
+        if (db) {
+
+          await new Promise((resolve, reject) => {
+
+            const tx = db.transaction(
+              CONFIG.CACHE_STORE_NAME,
+              "readwrite"
+            );
+
+            tx.objectStore(
+              CONFIG.CACHE_STORE_NAME
+            ).clear();
+
+            tx.oncomplete = resolve;
+            tx.onerror = () => reject(tx.error);
+            tx.onabort = () => reject(tx.error);
+
+          });
+
+        }
+
+        toast(
+          "AI metadata cache cleared. New generations will use Gemini again."
+        );
+
+      } catch (error) {
+
+        console.error(error);
+
+        toast(
+          "Could not clear the local metadata cache.",
+          false
+        );
+
+      }
+
+    }
+
+
+    async function sha256File(file) {
+
+      const buffer = await file.arrayBuffer();
+
+      if (window.crypto?.subtle) {
+
+        const digest = await crypto.subtle.digest(
+          "SHA-256",
+          buffer
+        );
+
+        return Array.from(new Uint8Array(digest))
+          .map(
+            byte => byte.toString(16).padStart(2, "0")
+          )
+          .join("");
+
+      }
+
+      // Very old-browser fallback. Modern browsers use SHA-256 above.
+      return [
+        file.name,
+        file.size,
+        file.lastModified
+      ].join(":");
+
+    }
+
+
+    function buildMetadataCacheKey(hash) {
+
+      return [
+        CONFIG.CACHE_VERSION,
+        CONFIG.GEMINI_MODELS.join("+") ,
+        hash
+      ].join("|");
+
+    }
+
+
+    function blobToDataUrl(blob) {
+
+      return new Promise((resolve, reject) => {
+
+        const reader = new FileReader();
+
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+
+        reader.readAsDataURL(blob);
+
+      });
+
+    }
+
+
+    async function prepareImageForAI(file) {
+
+      /*
+        Keep normal-sized images untouched. For very large images, resize
+        locally before sending them to Gemini. This cuts multimodal input
+        tokens while retaining enough detail for stock-photo recognition.
+      */
+
+      if (!file.type.startsWith("image/")) {
+
+        throw createApiError(
+          `Unsupported image file: ${file.name}`,
+          { retryable: false }
+        );
+
+      }
+
+      let bitmap;
+
+      try {
+        bitmap = await createImageBitmap(file);
+      } catch {
+        const raw = await toBase64(file);
+        return {
+          dataUrl: raw,
+          imageData: raw.split(",")[1],
+          mimeType: file.type || "image/jpeg",
+          wasResized: false
+        };
+      }
+
+      const width = bitmap.width;
+      const height = bitmap.height;
+
+      if (
+        Math.max(width, height) <=
+        CONFIG.MAX_AI_IMAGE_DIMENSION
+      ) {
+
+        bitmap.close?.();
+
+        const raw = await toBase64(file);
+
+        return {
+          dataUrl: raw,
+          imageData: raw.split(",")[1],
+          mimeType: file.type || "image/jpeg",
+          wasResized: false,
+          width,
+          height
+        };
+
+      }
+
+      const scale =
+        CONFIG.MAX_AI_IMAGE_DIMENSION /
+        Math.max(width, height);
+
+      const targetWidth =
+        Math.max(1, Math.round(width * scale));
+
+      const targetHeight =
+        Math.max(1, Math.round(height * scale));
+
+      const canvas = document.createElement("canvas");
+
+      canvas.width = targetWidth;
+      canvas.height = targetHeight;
+
+      const ctx = canvas.getContext("2d", {
+        alpha: true,
+        willReadFrequently: false
+      });
+
+      if (!ctx) {
+        bitmap.close?.();
+        const raw = await toBase64(file);
+        return {
+          dataUrl: raw,
+          imageData: raw.split(",")[1],
+          mimeType: file.type || "image/jpeg",
+          wasResized: false
+        };
+      }
+
+      ctx.imageSmoothingEnabled = true;
+      ctx.imageSmoothingQuality = "high";
+
+      ctx.drawImage(
+        bitmap,
+        0,
+        0,
+        targetWidth,
+        targetHeight
+      );
+
+      bitmap.close?.();
+
+      const outputType =
+        file.type === "image/png"
+          ? "image/png"
+          : file.type === "image/webp"
+            ? "image/webp"
+            : "image/jpeg";
+
+      const blob = await new Promise((resolve, reject) => {
+
+        canvas.toBlob(
+          result => {
+            if (result) resolve(result);
+            else reject(
+              new Error("Could not optimize image.")
+            );
+          },
+          outputType,
+          outputType === "image/png"
+            ? undefined
+            : CONFIG.JPEG_QUALITY
+        );
+
+      });
+
+      const dataUrl = await blobToDataUrl(blob);
+
+      return {
+        dataUrl,
+        imageData: dataUrl.split(",")[1],
+        mimeType: blob.type || outputType,
+        wasResized: true,
+        width: targetWidth,
+        height: targetHeight
+      };
+
+    }
+
+
+    function parseKeywordArray(value) {
+
+      if (Array.isArray(value)) {
+        return value
+          .map(item => String(item).trim())
+          .filter(Boolean);
+      }
+
+      return String(value || "")
+        .split(",")
+        .map(item => item.trim())
+        .filter(Boolean);
+
+    }
+
+
+    function fitTitleToLength(title, maxLength) {
+
+      const normalized = String(title || "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      if (!normalized) return "";
+      if (normalized.length <= maxLength) return normalized;
+
+      const slice = normalized.slice(0, maxLength + 1);
+      const lastSpace = slice.lastIndexOf(" ");
+
+      let result =
+        lastSpace >= Math.floor(maxLength * 0.70)
+          ? slice.slice(0, lastSpace)
+          : normalized.slice(0, maxLength);
+
+      result = result
+        .replace(/[,:;|\-–—]+$/g, "")
+        .trim();
+
+      return result || normalized.slice(0, maxLength).trim();
+
+    }
+
+
+    function normalizeKeywords(value, count) {
+
+      const requested = Math.max(0, Number(count) || 0);
+
+      const source =
+        Array.isArray(value)
+          ? value
+          : parseKeywordArray(value);
+
+      const seen = new Set();
+      const output = [];
+
+      for (const raw of source) {
+
+        let keyword = String(raw ?? "")
+          .replace(/[\r\n\t]+/g, " ")
+          .replace(/\s+/g, " ")
+          .replace(/[;|]+/g, " ")
+          .replace(/^[-–—•·]+|[-–—•·]+$/g, "")
+          .trim();
+
+        if (!keyword) continue;
+
+        keyword = keyword
+          .replace(/^['\"]+|['\"]+$/g, "")
+          .trim();
+
+        if (!keyword) continue;
+
+        const key = keyword.toLocaleLowerCase();
+        if (seen.has(key)) continue;
+
+        seen.add(key);
+        output.push(keyword);
+
+        if (output.length >= requested) break;
+      }
+
+      return output.join(", ");
+
+    }
+
+
+    function buildRequestedMetadata(master, titleLength, keywordCount) {
+
+      const keywords = normalizeKeywords(
+        parseKeywordArray(master.keywords),
+        keywordCount
+      );
+
+      return {
+        title: fitTitleToLength(
+          master.title,
+          titleLength
+        ),
+        keywords
+      };
 
     }
 
@@ -2419,6 +2964,328 @@
        API ERROR
     ===================================================== */
 
+    function sleep(ms) {
+
+      return new Promise(
+        resolve => setTimeout(resolve, ms)
+      );
+
+    }
+
+
+    function createApiError(
+      message,
+      details = {}
+    ) {
+
+      const error =
+        new Error(
+          message ||
+          "API request failed."
+        );
+
+      Object.assign(
+        error,
+        details
+      );
+
+      return error;
+
+    }
+
+
+    function isTransientError(
+      error
+    ) {
+
+      const status =
+        Number(
+          error?.status ||
+          0
+        );
+
+
+      // Standard transient HTTP failures.
+      if (
+        [
+          408,
+          425,
+          429,
+          500,
+          502,
+          503,
+          504
+        ].includes(status)
+      ) {
+
+        return true;
+
+      }
+
+
+      // Browser/network failures from fetch().
+      if (
+        error instanceof TypeError
+      ) {
+
+        return true;
+
+      }
+
+
+      const message =
+        String(
+          error?.message ||
+          ""
+        ).toLowerCase();
+
+
+      // Gemini can surface overload/rate-limit errors with useful
+      // human-readable messages even when the exact status is hidden.
+      return /high demand|spike(?:s)? in demand|temporar(?:y|ily)|overload(?:ed)?|try again later|resource[_ -]?exhausted|rate[_ -]?limit|too many requests|service unavailable|internal server error|bad gateway|gateway timeout|network error|failed to fetch|fetch failed/.test(
+        message
+      );
+
+    }
+
+
+    function getRetryAfterMs(
+      response,
+      data
+    ) {
+
+      const headerValue =
+        response?.headers?.get?.(
+          "Retry-After"
+        );
+
+
+      if (headerValue) {
+
+        const seconds =
+          Number(
+            headerValue
+          );
+
+        if (
+          Number.isFinite(seconds) &&
+          seconds >= 0
+        ) {
+
+          return Math.min(
+            seconds * 1000,
+            CONFIG.RETRY_MAX_DELAY_MS
+          );
+
+        }
+
+      }
+
+
+      // Some APIs provide a retry delay in error details.
+      const retrySeconds =
+        Number(
+          data?.error?.details?.find?.(
+            detail =>
+              detail?.retryDelay ||
+              detail?.retry_delay
+          )?.retryDelay ||
+          data?.error?.details?.find?.(
+            detail =>
+              detail?.retryDelay ||
+              detail?.retry_delay
+          )?.retry_delay
+        );
+
+
+      if (
+        Number.isFinite(retrySeconds) &&
+        retrySeconds >= 0
+      ) {
+
+        return Math.min(
+          retrySeconds * 1000,
+          CONFIG.RETRY_MAX_DELAY_MS
+        );
+
+      }
+
+
+      return 0;
+
+    }
+
+
+    async function retryUntilSuccess(
+      operation,
+      options = {}
+    ) {
+
+      const label =
+        options.label ||
+        "Request";
+
+      const onRetry =
+        typeof options.onRetry === "function"
+          ? options.onRetry
+          : null;
+
+      const maxAttempts =
+        Number.isFinite(Number(options.maxAttempts))
+          ? Math.max(1, Number(options.maxAttempts))
+          : Infinity;
+
+      let attempt =
+        0;
+
+
+      while (true) {
+
+        attempt += 1;
+
+        try {
+
+          return await operation(
+            attempt
+          );
+
+        } catch (error) {
+
+          const retryable =
+            Boolean(
+              error?.retryable
+            ) ||
+            isTransientError(
+              error
+            );
+
+
+          if (!retryable || attempt >= maxAttempts) {
+
+            throw error;
+
+          }
+
+
+          // Exponential backoff + jitter. After the cap is reached,
+          // retries continue at roughly the capped interval.
+          const exponentialDelay =
+            Math.min(
+              CONFIG.RETRY_MAX_DELAY_MS,
+              CONFIG.RETRY_BASE_DELAY_MS *
+                Math.pow(
+                  2,
+                  Math.min(
+                    attempt - 1,
+                    6
+                  )
+                )
+            );
+
+          const jitter =
+            Math.floor(
+              Math.random() *
+              CONFIG.RETRY_JITTER_MS
+            );
+
+          const serverDelay =
+            Number(
+              error?.retryAfterMs ||
+              0
+            );
+
+          const delay =
+            Math.min(
+              CONFIG.RETRY_MAX_DELAY_MS,
+              Math.max(
+                serverDelay,
+                exponentialDelay + jitter
+              )
+            );
+
+          console.warn(
+            `${label} temporary failure. ` +
+            `Retry #${attempt} in ${delay}ms.`,
+            error
+          );
+
+          if (onRetry) {
+
+            onRetry(
+              attempt,
+              delay,
+              error
+            );
+
+          }
+
+          await sleep(
+            delay
+          );
+
+        }
+
+      }
+
+    }
+
+
+    async function fetchWithTimeout(
+      url,
+      options,
+      timeoutMs = CONFIG.REQUEST_TIMEOUT_MS
+    ) {
+
+      const controller =
+        new AbortController();
+
+      const timeoutId =
+        setTimeout(
+          () => controller.abort(),
+          timeoutMs
+        );
+
+
+      try {
+
+        return await fetch(
+          url,
+          {
+            ...options,
+            signal:
+              controller.signal
+          }
+        );
+
+      } catch (error) {
+
+        if (
+          error?.name ===
+          "AbortError"
+        ) {
+
+          throw createApiError(
+            `${options?.headers?.["x-api-label"] || "AI request"} timed out. Retrying automatically.`,
+            {
+              retryable: true
+            }
+          );
+
+        }
+
+        throw error;
+
+      } finally {
+
+        clearTimeout(
+          timeoutId
+        );
+
+      }
+
+    }
+
+
     async function parseApiResponse(
       response
     ) {
@@ -2437,16 +3304,36 @@
       }
 
 
+      const message =
+        data?.error?.message ||
+        data?.message ||
+        `Request failed with HTTP ${response.status}.`;
+
+
       if (!response.ok) {
 
-        const message =
-          data?.error?.message ||
-          data?.message ||
-          `Request failed with HTTP ${response.status}.`;
-
-
-        throw new Error(
-          message
+        throw createApiError(
+          message,
+          {
+            status:
+              response.status,
+            code:
+              data?.error?.status ||
+              data?.error?.code,
+            retryAfterMs:
+              getRetryAfterMs(
+                response,
+                data
+              ),
+            retryable:
+              isTransientError(
+                {
+                  status:
+                    response.status,
+                  message
+                }
+              )
+          }
         );
 
       }
@@ -2454,9 +3341,30 @@
 
       if (data?.error) {
 
-        throw new Error(
-          data.error.message ||
-          "API returned an error."
+        throw createApiError(
+          message ||
+          "API returned an error.",
+          {
+            status:
+              Number(
+                data.error.code ||
+                0
+              ),
+            code:
+              data.error.status ||
+              data.error.code,
+            retryable:
+              isTransientError(
+                {
+                  status:
+                    Number(
+                      data.error.code ||
+                      0
+                    ),
+                  message
+                }
+              )
+          }
         );
 
       }
@@ -2475,72 +3383,53 @@
       apiKey,
       file,
       titleLength,
-      keywordCount
+      keywordCount,
+      model = CONFIG.GEMINI_MODELS[0]
     ) {
 
-      const base64 =
-        await toBase64(
-          file
-        );
-
+      const preparedImage =
+        await prepareImageForAI(file);
 
       const imageData =
-        base64.split(",")[1];
-
+        preparedImage.imageData;
 
       if (!imageData) {
 
-        throw new Error(
-          `Could not read ${file.name}.`
+        throw createApiError(
+          `Could not read ${file.name}.`,
+          { retryable: false }
         );
 
       }
 
-
       const prompt = `
-Analyze the supplied stock image and generate Adobe Stock metadata.
+Inspect this stock image and produce one reusable master metadata result.
 
-Return ONLY one JSON object.
+Master output targets:
+- Title: natural, commercial, search-friendly, up to ${CONFIG.MASTER_TITLE_LENGTH} characters.
+- Keywords: exactly ${CONFIG.MASTER_KEYWORD_COUNT} unique phrases, strongest first.
 
-Required format:
+The image is the only source of truth. Do not invent identities, brands,
+locations, objects, actions, events, camera settings, emotions, or concepts
+that are not reasonably supported by visible content.
 
-{
-  "title": "string",
-  "keywords": "keyword1, keyword2, keyword3"
-}
+Keyword priority:
+1. Primary subject.
+2. Important visible objects and actions.
+3. Environment, setting, scene, and composition.
+4. Clearly visible colors, style, material, texture, and visual characteristics.
+5. Clearly supported commercial or conceptual terms.
 
-Requirements:
-
-1. Title:
-- Approximately ${titleLength} characters.
-- Accurate and commercially useful.
-- Search-friendly.
-- Natural wording.
-- Do not use quotes around the title inside the value.
-
-2. Keywords:
-- Exactly ${keywordCount} keywords.
-- Comma-separated.
-- Put the strongest and most relevant keywords first.
-- Use unique keywords.
-- Include visible subjects, objects, concepts, setting,
-  colors, style, composition and relevant commercial concepts
-  only when supported by the image.
-- Do not invent anything that is not visible.
-- Avoid filler.
-- Avoid duplicate words.
-- Do not number the keywords.
-
-3. Output:
-- Valid JSON only.
-- No Markdown.
-- No explanation.
-- No additional fields.
+Avoid filler, keyword stuffing, duplicates, near-duplicates, unsupported claims,
+hashtags, numbering, and keywords containing commas. Keep the strongest terms
+at the beginning because the browser may use only the first ${keywordCount}.
 `;
 
+      apiRequestCount += 1;
+      updateUsageStats();
 
       const response =
-        await fetch(
+        await fetchWithTimeout(
           CONFIG.GEMINI_ENDPOINT,
           {
             method: "POST",
@@ -2557,7 +3446,10 @@ Requirements:
               JSON.stringify({
 
                 model:
-                  CONFIG.GEMINI_MODEL,
+                  model,
+
+                system_instruction:
+                  "You are an expert commercial stock-photo metadata editor. Accuracy and visible evidence are more important than creativity. Return only the requested structured metadata.",
 
                 input: [
 
@@ -2568,6 +3460,7 @@ Requirements:
                       imageData,
 
                     mime_type:
+                      preparedImage.mimeType ||
                       file.type ||
                       "image/jpeg"
                   },
@@ -2579,45 +3472,89 @@ Requirements:
                       prompt
                   }
 
-                ]
+                ],
+
+                response_format: {
+
+                  type:
+                    "text",
+
+                  mime_type:
+                    "application/json",
+
+                  schema: {
+
+                    type:
+                      "object",
+
+                    properties: {
+
+                      title: {
+                        type:
+                          "string",
+                        description:
+                          `A natural stock title of up to ${CONFIG.MASTER_TITLE_LENGTH} characters.`
+                      },
+
+                      keywords: {
+                        type:
+                          "array",
+                        description:
+                          `Exactly ${CONFIG.MASTER_KEYWORD_COUNT} unique keyword phrases, strongest first.`,
+                        items: {
+                          type:
+                            "string"
+                        }
+                      }
+
+                    },
+
+                    required: [
+                      "title",
+                      "keywords"
+                    ]
+
+                  }
+
+                },
+
+                generation_config: {
+                  max_output_tokens:
+                    650
+                }
 
               })
 
-          }
+          },
+          CONFIG.REQUEST_TIMEOUT_MS
         );
-
 
       const data =
         await parseApiResponse(
           response
         );
 
-
       const text =
         getInteractionText(
           data
         );
 
-
       if (!text) {
 
-        throw new Error(
-          "Gemini returned no text output."
+        throw createApiError(
+          "Gemini returned no text output.",
+          { retryable: true }
         );
 
       }
 
-
       let parsed;
-
 
       try {
 
         parsed =
           JSON.parse(
-            cleanJson(
-              text
-            )
+            cleanJson(text)
           );
 
       } catch (error) {
@@ -2627,304 +3564,330 @@ Requirements:
           text
         );
 
-        throw new Error(
-          "Gemini returned invalid JSON. Please try again."
+        throw createApiError(
+          "Gemini returned invalid JSON. Retrying automatically.",
+          {
+            retryable: true,
+            cause: error
+          }
         );
 
       }
-
 
       if (
         !parsed ||
-        typeof parsed.title !==
-          "string" ||
-        typeof parsed.keywords !==
-          "string"
+        typeof parsed.title !== "string" ||
+        !Array.isArray(parsed.keywords)
       ) {
 
-        throw new Error(
-          "Gemini returned incomplete metadata."
+        throw createApiError(
+          "Gemini returned incomplete structured metadata. Retrying automatically.",
+          { retryable: true }
         );
 
       }
 
-
-      parsed.title =
+      const title =
         parsed.title.trim();
 
+      if (!title) {
 
-      parsed.keywords =
-        normalizeKeywords(
-          parsed.keywords,
-          keywordCount
+        throw createApiError(
+          "Gemini returned an empty title. Retrying automatically.",
+          { retryable: true }
         );
 
+      }
 
-      return parsed;
+      const keywordList =
+        parseKeywordArray(
+          parsed.keywords
+        )
+          .map(
+            keyword =>
+              keyword
+                .replace(/,/g, " ")
+                .replace(/\s+/g, " ")
+                .trim()
+          )
+          .filter(Boolean);
+
+      const normalized =
+        normalizeKeywords(
+          keywordList,
+          CONFIG.MASTER_KEYWORD_COUNT
+        );
+
+      const finalKeywords =
+        normalized
+          ? normalized
+              .split(", ")
+              .filter(Boolean)
+          : [];
+
+      if (
+        finalKeywords.length <
+        CONFIG.MASTER_KEYWORD_COUNT
+      ) {
+
+        throw createApiError(
+          `Gemini returned ${finalKeywords.length} usable keywords; ${CONFIG.MASTER_KEYWORD_COUNT} are required. Retrying automatically.`,
+          { retryable: true }
+        );
+
+      }
+
+      return {
+
+        title,
+
+        keywords:
+          finalKeywords
+            .slice(0, CONFIG.MASTER_KEYWORD_COUNT)
+            .join(", ")
+
+      };
 
     }
 
 
-    /* =====================================================
-       CHATGPT
-    ===================================================== */
-
-    async function generateChatGPTMetadata(
+    async function generateGeminiMetadataWithRetry(
       apiKey,
+      file,
       titleLength,
       keywordCount
     ) {
 
-      const prompt = `
-Generate professional Adobe Stock metadata.
+      let lastError = null;
 
-Return ONLY one JSON object.
-
-{
-  "title": "string",
-  "keywords": "keyword1, keyword2, keyword3"
-}
-
-Requirements:
-
-- Title approximately ${titleLength} characters.
-- Exactly ${keywordCount} comma-separated keywords.
-- Strongest keywords first.
-- Unique keywords.
-- Relevant stock-photo terminology.
-- No Markdown.
-- No explanation.
-- No additional fields.
-`;
-
-
-      const response =
-        await fetch(
-          CONFIG.OPENAI_ENDPOINT,
-          {
-            method: "POST",
-
-            headers: {
-              "Content-Type":
-                "application/json",
-
-              "Authorization":
-                `Bearer ${apiKey}`
-            },
-
-            body:
-              JSON.stringify({
-
-                model:
-                  CONFIG.OPENAI_MODEL,
-
-                messages: [
-
-                  {
-                    role: "user",
-
-                    content:
-                      prompt
-
-                  }
-
-                ],
-
-                temperature:
-                  0.7
-
-              })
-
-          }
-        );
-
-
-      const data =
-        await parseApiResponse(
-          response
-        );
-
-
-      const rawText =
-        data?.choices?.[0]
-          ?.message
-          ?.content;
-
-
-      if (!rawText) {
-
-        throw new Error(
-          "ChatGPT returned no text output."
-        );
-
-      }
-
-
-      let parsed;
-
-
-      try {
-
-        parsed =
-          JSON.parse(
-            cleanJson(
-              rawText
-            )
-          );
-
-      } catch {
-
-        throw new Error(
-          "ChatGPT returned invalid JSON."
-        );
-
-      }
-
-
-      if (
-        !parsed.title ||
-        !parsed.keywords
+      for (
+        let modelIndex = 0;
+        modelIndex < CONFIG.GEMINI_MODELS.length;
+        modelIndex++
       ) {
 
-        throw new Error(
-          "ChatGPT returned incomplete metadata."
-        );
+        const model =
+          CONFIG.GEMINI_MODELS[modelIndex];
 
-      }
+        try {
 
+          return await retryUntilSuccess(
+            attempt =>
+              generateGeminiMetadata(
+                apiKey,
+                file,
+                titleLength,
+                keywordCount,
+                model
+              ),
+            {
+              label:
+                `${model} · ${file.name}`,
 
-      parsed.title =
-        String(
-          parsed.title
-        ).trim();
+              maxAttempts:
+                CONFIG.RETRIES_PER_MODEL,
 
+              onRetry:
+                (
+                  retryNumber,
+                  delay,
+                  error
+                ) => {
 
-      parsed.keywords =
-        normalizeKeywords(
-          parsed.keywords,
-          keywordCount
-        );
+                  setStatus(
+                    `Retrying ${model}`,
+                    true
+                  );
 
+                  const seconds =
+                    Math.max(
+                      1,
+                      Math.ceil(
+                        delay / 1000
+                      )
+                    );
 
-      return parsed;
+                  $("progressText")
+                    .textContent =
+                    `${file.name} · ${model} busy, retry ${retryNumber} in ${seconds}s`;
 
-    }
+                  console.info(
+                    `${model} retry #${retryNumber} for ${file.name}:`,
+                    error?.message ||
+                      error
+                  );
 
-
-    /* =====================================================
-       KEYWORD NORMALIZATION
-    ===================================================== */
-
-    function normalizeKeywords(
-      value,
-      targetCount
-    ) {
-
-      let keywords;
-
-
-      if (
-        Array.isArray(value)
-      ) {
-
-        keywords =
-          value
-            .map(
-              item =>
-                String(item)
-                  .trim()
-            )
-            .filter(Boolean);
-
-      } else {
-
-        keywords =
-          String(value)
-            .split(",")
-            .map(
-              item =>
-                item.trim()
-            )
-            .filter(Boolean);
-
-      }
-
-
-      /*
-        Remove exact duplicates while preserving order.
-      */
-
-      const seen =
-        new Set();
-
-
-      keywords =
-        keywords.filter(
-          keyword => {
-
-            const key =
-              keyword.toLowerCase();
-
-
-            if (
-              seen.has(key)
-            ) {
-
-              return false;
+                }
 
             }
+          );
 
+        } catch (error) {
 
-            seen.add(key);
+          lastError = error;
 
-            return true;
+          const hasNextModel =
+            modelIndex <
+            CONFIG.GEMINI_MODELS.length - 1;
 
+          const retryable =
+            Boolean(error?.retryable) ||
+            isTransientError(error);
+
+          if (!retryable || !hasNextModel) {
+            throw error;
           }
+
+          const nextModel =
+            CONFIG.GEMINI_MODELS[
+              modelIndex + 1
+            ];
+
+          setStatus(
+            `Switching to ${nextModel}`,
+            true
+          );
+
+          $("progressText")
+            .textContent =
+            `${file.name} · switching to ${nextModel}`;
+
+          console.warn(
+            `${model} is still busy; failing over to ${nextModel}.`,
+            error
+          );
+
+        }
+
+      }
+
+      throw lastError ||
+        createApiError(
+          "No Gemini Lite model was available.",
+          { retryable: true }
         );
-
-
-      /*
-        Do not fabricate keywords if the model
-        returned fewer than requested.
-        Keep the actual generated list.
-      */
-
-      return keywords.join(", ");
 
     }
 
 
     /* =====================================================
-       PROGRESS
+       CACHE-AWARE GEMINI PROCESSING
     ===================================================== */
 
-    function showProgress(
-      current,
-      total,
-      filename
+    async function getOrGenerateMasterMetadata(
+      apiKey,
+      file
     ) {
 
-      const percent =
-        Math.round(
-          (current /
-            Math.max(total, 1)) *
-          100
+      const hash =
+        await sha256File(file);
+
+      const cacheKey =
+        buildMetadataCacheKey(hash);
+
+      const cached =
+        await cacheGet(cacheKey);
+
+      if (
+        cached &&
+        cached.version === CONFIG.CACHE_VERSION &&
+        typeof cached.title === "string" &&
+        typeof cached.keywords === "string"
+      ) {
+
+        cacheHitCount += 1;
+        updateUsageStats();
+
+        return {
+          master: {
+            title: cached.title,
+            keywords: cached.keywords
+          },
+          source: "cache"
+        };
+
+      }
+
+      const master =
+        await generateGeminiMetadataWithRetry(
+          apiKey,
+          file,
+          CONFIG.MASTER_TITLE_LENGTH,
+          CONFIG.MASTER_KEYWORD_COUNT
         );
 
+      await cacheSet(
+        cacheKey,
+        master,
+        file.name
+      );
 
-      $("progressText")
-        .textContent =
-        `Processing ${current}/${total} · ${filename}`;
+      return {
+        master,
+        source: "api"
+      };
+
+    }
 
 
-      $("progressPercent")
-        .textContent =
-        `${percent}%`;
+    function showProgress(current, total, text) {
+
+      const safeTotal = Math.max(Number(total) || 1, 1);
+      const safeCurrent = Math.min(
+        Math.max(Number(current) || 0, 0),
+        safeTotal
+      );
+
+      const percent = Math.round(
+        (safeCurrent / safeTotal) * 100
+      );
+
+      const box = $("progressBox");
+      const bar = $("progressBar");
+      const percentEl = $("progressPercent");
+      const textEl = $("progressText");
+
+      if (box) {
+        box.classList.remove("hidden");
+      }
+
+      if (bar) {
+        bar.style.width = `${percent}%`;
+      }
+
+      if (percentEl) {
+        percentEl.textContent = `${percent}%`;
+      }
+
+      if (textEl && text) {
+        textEl.textContent = String(text);
+      }
+    }
 
 
-      $("progressBar")
-        .style.width =
-        `${percent}%`;
+    function hideProgress() {
+
+      const box = $("progressBox");
+
+      if (box) {
+        box.classList.add("hidden");
+      }
+    }
+
+
+    function updateUsageStats() {
+
+      if ($("statApiCalls")) {
+        $("statApiCalls")
+          .textContent =
+          String(apiRequestCount);
+      }
+
+      if ($("statSaved")) {
+        $("statSaved")
+          .textContent =
+          String(cacheHitCount);
+      }
 
     }
 
@@ -2974,6 +3937,10 @@ Requirements:
         return;
 
       }
+
+      apiRequestCount = 0;
+      cacheHitCount = 0;
+      updateUsageStats();
 
 
       /*
@@ -3093,24 +4060,32 @@ Requirements:
             const file =
               files[index];
 
-
             showProgress(
               index + 1,
               files.length,
               file.name
             );
 
-
             try {
 
-              const metadata =
-                await generateGeminiMetadata(
+              const outcome =
+                await getOrGenerateMasterMetadata(
                   apiKey,
-                  file,
+                  file
+                );
+
+              const metadata =
+                buildRequestedMetadata(
+                  outcome.master,
                   titleLength,
                   keywordCount
                 );
 
+              $("progressText")
+                .textContent =
+                outcome.source === "cache"
+                  ? `Cache hit · ${file.name} · 0 new API calls`
+                  : `Generated · ${file.name} · Gemini Lite`;
 
               results.push({
 
@@ -3125,13 +4100,11 @@ Requirements:
 
               });
 
-
               appendResultCard(
                 file.name,
                 metadata.title,
                 metadata.keywords
               );
-
 
             } catch (fileError) {
 
@@ -3140,14 +4113,12 @@ Requirements:
                 fileError
               );
 
-
               appendErrorCard(
                 file.name,
                 fileError.message
               );
 
             }
-
 
             updateStats();
 
@@ -4237,6 +5208,10 @@ Requirements:
       $("statKeywords")
         .textContent =
         "0";
+
+      apiRequestCount = 0;
+      cacheHitCount = 0;
+      updateUsageStats();
 
 
       $("resultBadge")
